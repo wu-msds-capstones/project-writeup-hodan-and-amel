@@ -1,22 +1,695 @@
 ---
-title: "Capstone Project"
-subtitle: Subtitle
-authors:
-  - Bob
-  - Jane
-bibliography: references.bib
-title-block-banner: true
-format: 
+title: "New York Bail Reform and Pretrial Detention Outcomes"
+author: "Hodan Aden and Amel Osman"
+format:
   html:
-    theme:
-      light: lightly
-      dark: darkly
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
-{{< include _01_intro.qmd >}}
-{{< include _02_background.qmd >}}
-{{< include _03_data.qmd >}}
-{{< include _04_analysis.qmd >}}
-{{< include _05_results.qmd >}}
-{{< include _06_conclusions.qmd >}}
-{{< include _07_references.qmd >}}
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+library(tidyverse)
+library(scales)
+library(ggrepel)
+library(DBI)
+library(duckdb)
+library(reticulate)
+```
+
+
+
+```{r}
+#| label: db-connect
+#| echo: false
+#| message: false
+#| warning: false
+
+con <- dbConnect(duckdb(), dbdir = "/Users/amelosman/Downloads/capstone.duckdb", read_only = TRUE)
+```
+
+
+## Introduction and Motivation
+
+Imagine getting arrested on a nonviolent charge and, because you can't afford bail, sitting in jail for weeks before your case is even resolved. Does that detention itself change whether you end up convicted, separate from the facts of the case against you? New York's 2020 bail reform law is now six years old, and whether it actually worked is still an open question.
+This project uses 1.24 million New York State case records from 2019 through 2024 to look at that question directly. It also looks at whether the relationship between detention and conviction depends on a county's poverty rate, and whether the 2020 reform changed that relationship once it took effect.
+Someone held pretrial can lose their job, their housing, or custody of their kids before a conviction has even happened. County courts have to decide how to allocate bail resources. State legislators need evidence about whether reform is working. And other states considering similar laws are watching what happens in New York.
+"Pretrial detention" means being held in jail after arrest but before trial, usually because bail couldn't be paid or was denied outright. "Conviction" covers any case that resolved in a guilty finding or plea, as opposed to dismissal or a not guilty finding. New York's 2020 reform eliminated cash bail for most misdemeanors and non-violent felonies, so defendants who would have been held pretrial before 2020 are now released while their case proceeds.
+
+
+## Background and Related Work
+
+Two studies in particular helped shape how we approached this project. The first, Dobbie and Yang (2021), looked at counties over a ten year period and found that areas with higher levels of pretrial detention also had higher poverty and lower employment. What stood out to us was that the effects went beyond the people who were arrested. Children born in counties with high levels of detention ended up earning less money later in life. Because of this, we didn't want to treat county poverty as just another variable to control for. We wanted to look at it more directly.
+The second study, Dobbie, Goldin, and Yang (2018), looked at the relationship between pretrial detention and case outcomes in a different way. Judges are assigned to cases essentially at random, so the authors used this to separate the effect of detention from other factors related to the defendant or the charge. They found that being detained increased the likelihood of conviction, mainly because detained defendants were more likely to plead guilty. However, their study did not focus on New York, did not examine the 2020 bail reform, and did not consider whether county poverty changes the relationship. Our project builds on this research by looking at these factors together in New York.
+
+## Data Engineering
+
+New York's Division of Criminal Justice Services (DCJS) and Office of Court Administration (OCA) publicly release the Supplemental Pretrial Release Data File as part of a reporting requirement created by the 2019 bail reform law. The data contains over 1.3 million case records from 2019 through 2024 across New York court types. We combined this data with county-level poverty estimates from the U.S. Census American Community Survey (ACS) for all 62 New York counties.
+
+We combined the two DCJS extracts and filtered the data to cases arraigned between 2019 and 2024, matching the time period covered by the reporting requirement. Out-of-state cases got dropped too, since they couldn't be matched to our county-level poverty data. We also limited the dataset to resolved cases. A case still marked "Pending" doesn't have a final outcome, so it can't tell us anything about whether the case ended in a conviction.
+
+We then created the variables needed for our analysis. "Convicted" and "detained" weren't variables that already existed in the raw data. "Convicted" comes from the case disposition field, coded as 1 when the case ended in a conviction and 0 otherwise, while "detained" comes from the pretrial release outcome field, coded as 1 when the defendant was remanded or didn't post bail within five days and 0 otherwise. We also created a `post_reform` variable to separate the pre-reform period (2019) from cases after the reform (2020–2024), since 2019 was the only full year of data available before the law took effect.
+
+ACS poverty estimates were joined to the case-level data using county and year. Since ACS 5-year poverty estimates are not available for every year in our study period, the county poverty rate only covers 2020 through 2022. This limited the years we could use for the poverty-focused analysis (Figure 2).
+
+One issue we found during the cleaning process was that the raw DCJS extract contained arraignment records going back to 1969, even though the dataset is supposed to cover 2019 through 2024. We filtered out those records along with the other exclusions described above. After cleaning, we ended up with 1,253,815 resolved DCJS cases and 186 county-year poverty estimates across 62 New York counties and 3 survey years.
+
+The cleaned data was stored in a relational database with three tables. `cases` contains individual arraignment records such as disposition, charge type, detention status, conviction outcome, and release decision. `counties` uses county name as the primary key, and `poverty` contains the ACS poverty rate, poverty count, and total population by county and year. Both `cases` and `poverty` connect to `counties` through the `county_name` field, which allows the poverty information to be matched to individual case records. All three tables are in Third Normal Form, with primary keys and NOT NULL constraints on the main identifier and join columns.
+
+**Consent and provenance.** People in this dataset did not consent to having their case records used for research. DCJS released the data because of a reporting requirement under the 2019 reform law, rather than as an opt-in research dataset. We think this is important to keep in mind when interpreting and sharing the results, and we discuss this further in the Data Ethics section.
+
+
+
+
+```{r}
+
+#| label: build-pipeline
+#| echo: false
+#| message: false
+#| warning: false
+dcjs <- tbl(con, "cases") %>%
+  filter(
+    arr_yr >= 2019, arr_yr <= 2024,
+    arr_county != "Out of State",
+    disposition != "Pending"
+  ) %>%
+  collect() %>%
+  mutate(
+    convicted   = if_else(disposition == "Conviction", 1L, 0L),
+    detained    = if_else(larg_rel_outcome %in%
+                    c("BailNotPaid w/in 5days", "Remanded"), 1L, 0L),
+    post_reform = if_else(arr_yr >= 2020, "Post-Reform (2020-2024)",
+                           "Pre-Reform (2019)"),
+    charge_type = case_when(
+      str_detect(larg_class, "Felony") ~ "Felony",
+      str_detect(larg_class, "Misdemeanor") ~ "Misdemeanor",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(!is.na(detained), !is.na(convicted),
+         !arr_re_combi %in% c("Unknown", "Other"))
+
+# Poverty estimates and county names come straight from the poverty/counties
+# tables, joined in the database rather than parsed out of the raw ACS
+# extracts on every render.
+acs <- tbl(con, "poverty") %>%
+  left_join(tbl(con, "counties"), by = "county_name") %>%
+  select(acs_year = year, county = county_name, pct_poverty = pct_below_poverty) %>%
+  collect()
+
+# Map each arraignment year to the nearest available ACS poverty estimate year
+acs_year_map <- tibble(
+  arr_yr   = c(2019L, 2020L, 2021L, 2022L, 2023L, 2024L),
+  acs_year = c(2020L, 2020L, 2021L, 2021L, 2022L, 2022L)
+)
+
+# Data for Figure 1: conviction rate by detention status, charge type, reform period
+fig1_data <- dcjs %>%
+  filter(charge_type != "Other") %>%
+  group_by(post_reform, charge_type, detained) %>%
+  summarise(
+    conv_rate = mean(convicted) * 100,
+    n = n(), .groups = "drop"
+  ) %>%
+  mutate(
+    Status = if_else(detained == 1, "Detained", "Released"),
+    post_reform = factor(post_reform,
+      levels = c("Pre-Reform (2019)", "Post-Reform (2020-2024)"))
+  )
+
+fig1_gap <- fig1_data %>%
+  select(post_reform, charge_type, Status, conv_rate) %>%
+  pivot_wider(names_from = Status, values_from = conv_rate) %>%
+  mutate(gap = round(Detained - Released, 1),
+         gap_label = paste0("+", gap, "pp"))
+
+# Data for Figure 2: county-level detention-conviction gap vs. poverty rate
+county_gap <- dcjs %>%
+  filter(charge_type != "Other") %>%
+  left_join(acs_year_map, by = "arr_yr") %>%
+  left_join(acs, by = c("arr_county" = "county", "acs_year")) %>%
+  filter(!is.na(pct_poverty)) %>%
+  group_by(arr_county, acs_year, pct_poverty) %>%
+  summarise(
+    conv_detained = mean(convicted[detained == 1], na.rm = TRUE) * 100,
+    conv_released = mean(convicted[detained == 0], na.rm = TRUE) * 100,
+    n_detained    = sum(detained == 1),
+    .groups       = "drop"
+  ) %>%
+  mutate(gap = conv_detained - conv_released) %>%
+  rename(county = arr_county)
+
+county_gap_clean <- county_gap %>%
+  drop_na(pct_poverty, gap, n_detained)
+
+# Case-level dataset used for the machine learning models later in this document
+ml_data <- dcjs %>%
+  filter(charge_type != "Other") %>%
+  left_join(acs_year_map, by = "arr_yr") %>%
+  left_join(acs, by = c("arr_county" = "county", "acs_year")) %>%
+  filter(!is.na(pct_poverty)) %>%
+  select(convicted, detained, pct_poverty, charge_type, post_reform,
+         arr_re_combi, arr_yr)
+
+saveRDS(ml_data, "ml_data.rds")
+```
+
+
+## Data Visualization and Statistical Thinking
+
+### Figure 1: Detention Status and Conviction Rate
+
+The first and most direct piece of evidence comes from a simple group
+comparison: conviction rates split by detention status, charge type, and
+reform period.
+
+```{r}
+#| label: fig-1
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Conviction rate by pretrial detention status and charge type, before vs. after New York's 2020 bail reform. Detained defendants are convicted at higher rates across every charge type and reform period, with the gap narrowing from 9.5-16.1 percentage points pre-reform to 4.2-9.7 percentage points post-reform. n = 1.25M cases (DCJS Pretrial Release Dataset, 2019-2024)."
+
+ggplot(fig1_data,
+    aes(x = post_reform, y = conv_rate, fill = Status)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = paste0(round(conv_rate, 1), "%")),
+            position = position_dodge(width = 0.7),
+            vjust = -0.4, size = 3.2, fontface = "bold") +
+  geom_label(data = fig1_gap,
+            aes(x = post_reform,
+                y = pmax(Detained, Released) + 15,
+                label = gap_label),
+            inherit.aes = FALSE,
+            size = 3.2, color = "white",
+            fill = "#c0392b",
+            fontface = "bold",
+            label.padding = unit(0.25, "lines")) +
+  facet_wrap(~ charge_type) +
+  scale_fill_manual(values = c("Detained" = "#c0392b",
+                               "Released" = "#2980b9")) +
+  scale_x_discrete(labels = c("Pre-Reform (2019)" = "Pre-Reform\n(2019)",
+                               "Post-Reform (2020-2024)" = "Post-Reform\n(2020-2024)")) +
+  scale_y_continuous(labels = label_percent(scale = 1),
+                     limits = c(0, 100),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title    = "Detained Defendants Are Convicted at Higher Rates Than Released Defendants",
+    subtitle = "Gap is largest for misdemeanors before the 2020 bail reform",
+    x        = "Reform Period",
+    y        = "Conviction Rate (%)",
+    fill     = "Detention Status"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    plot.subtitle      = element_text(color = "gray40"),
+    strip.text         = element_text(face = "bold", size = 11),
+    legend.position    = "top",
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(size = 9, lineheight = 0.9)
+  )
+```
+
+
+
+Detained defendants were convicted at higher rates than released defendants
+in every group shown. The gap was largest for misdemeanors before the 2020
+reform, at 16.1 percentage points, and dropped to 4.2 percentage points
+afterward, so the reform seems to have meaningfully cut the detention penalty
+for lower-level charges specifically. For felonies, the gap barely moved
+(9.5 percentage points pre-reform, 9.7 post-reform), which suggests the
+reform had less of an effect on more serious cases. This is the first
+evidence in the project that detention status, separate from charge type,
+tracks with conviction outcomes.
+
+### Figure 2: County Poverty Rate and the Detention-Conviction Gap
+
+```{r}
+#| label: fig-2
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "County poverty rate vs. the detention-conviction gap, by year (2020-2022). Each dot is one NY county-year, sized by number of detained cases. Higher-poverty counties show a larger gap between detained and released conviction rates, with the trend line weighted by case volume. Highlighted counties (outlined) are labeled directly on the chart."
+
+top_labels <- county_gap %>%
+  arrange(desc(gap)) %>%
+  slice(c(1:3, (n()-2):n())) %>%
+  pull(county)
+
+county_gap <- county_gap %>%
+  mutate(is_highlighted = county %in% top_labels)
+
+ggplot(county_gap, aes(x = pct_poverty, y = gap)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray60", linewidth = 0.5) +
+  geom_point(aes(size = n_detained, fill = gap,
+                 color = is_highlighted, stroke = is_highlighted),
+             shape = 21, alpha = 0.85) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = "white"),
+                      guide = "none") +
+  scale_discrete_manual(aesthetics = "stroke",
+                        values = c("TRUE" = 1.2, "FALSE" = 0.3),
+                        guide = "none") +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#c0392b", linewidth = 1.2,
+              fill = "#fadbd8") +
+  geom_text_repel(
+    data = county_gap %>% filter(county %in% top_labels),
+    aes(label = county),
+    size = 3.5, fontface = "bold",
+    box.padding = 1.4,
+    point.padding = 0.8,
+    segment.color = "gray50",
+    segment.size = 0.4,
+    max.overlaps = Inf,
+    force = 20) +
+  facet_wrap(~ acs_year) +
+  scale_fill_gradient2(low = "#2980b9", mid = "gray80",
+                        high = "#c0392b", midpoint = 0,
+                        name = "Conviction Gap (pp)") +
+  scale_size_continuous(name = "Detained Cases",
+                        range = c(2, 9), labels = comma) +
+  scale_x_continuous(labels = label_percent(scale = 1),
+                     breaks = scales::pretty_breaks(n = 3)) +
+  scale_y_continuous(labels = function(x) paste0(x, "pp")) +
+  labs(
+    title    = "Higher Poverty Counties Show a Larger Detention-Conviction Gap",
+    subtitle = "Each dot = one NY county in a given year; trend line weighted by case volume",
+    x        = "County Poverty Rate (ACS 5-Year Estimate)",
+    y        = "Detention-Conviction Gap (percentage points)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(color = "gray40", size = 11),
+    strip.text       = element_text(face = "bold", size = 12),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 11),
+    legend.text      = element_text(size = 10),
+    axis.title       = element_text(size = 11),
+    axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+    axis.text.y      = element_text(size = 9),
+    panel.spacing    = unit(1.5, "lines"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+To test whether this gap changes with a county's economic context, we
+aggregated case-level data to the county-year level and computed the gap in
+conviction rates between detained and released defendants for each county
+and year where ACS poverty data was available (2020-2022). We then fit a
+weighted linear regression, weighting by each county's number of detained
+cases (`n_detained`) so reliable, high-volume counties like Queens count more
+than small counties where a handful of cases can produce extreme, noisy gap
+estimates.
+
+```{r}
+#| label: model-poverty-gap
+#| echo: false
+#| message: false
+#| warning: false
+
+model_weighted <- lm(gap ~ pct_poverty, data = county_gap_clean,
+                      weights = n_detained)
+
+broom::tidy(model_weighted) %>%
+  mutate(across(where(is.numeric), ~round(., 4))) %>%
+  knitr::kable(caption = "Weighted regression of detention-conviction gap on county poverty rate")
+```
+
+Weighting counties by their number of detained cases made more sense for our analysis because small counties with only a few detained cases can have extreme gap estimates that may not represent a real pattern. In the weighted model, we found a small positive relationship between poverty rate and the gap. For every 1 percentage point increase in a county's poverty rate, the gap increased by about 0.13 percentage points (p = 0.048). The result is statistically significant, but only slightly, and poverty rate explains just 2.3% of the variation in the gap across counties. So while there is a relationship between poverty and the gap, it is fairly weak, suggesting that other factors are also contributing to differences between counties.
+
+
+
+
+
+
+```{r}
+#| label: residual-diagnostics
+#| echo: false
+#| message: false
+#| warning: false
+
+weighted_resid <- residuals(model_weighted) * sqrt(model_weighted$weights)
+
+tibble(
+  Statistic = c("Minimum", "1st Quartile", "Median", "3rd Quartile", "Maximum"),
+  Value = round(as.numeric(quantile(weighted_resid, 
+                                     probs = c(0, 0.25, 0.5, 0.75, 1))), 2)
+) %>%
+  knitr::kable(caption = "Weighted residuals from the poverty-gap regression model")
+```
+
+
+
+Residual diagnostics
+
+
+We checked the residuals to see whether the regression was a reasonable fit. The weighted residuals range from about -1,263 to +2,340, with a median of -162. The residuals are more negatively skewed, meaning that most counties fall somewhat below the fitted line, while a small number of high weight counties with many more detained cases have much larger positive residuals. This makes sense given that the weighted regression gives more influence to counties with larger numbers of detained cases, which can cause smaller counties to be consistently under or over predicted. Along with the low R-squared (0.023), these results suggest that the model explains only a small part of the variation in the detention-conviction gap across counties. Most of the variation is likely coming from factors that are not included in this model
+
+### Figure 3: Conviction Rates by Race, Ethnicity, and Detention Status
+
+```{r}
+#| label: fig-3
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: "Conviction rates by race/ethnicity, arraignment year, and detention status. Darker red indicates a higher conviction rate; the dashed line marks the 2020 bail reform. Native American detained-defendant cells for 2020-2021 are blank due to small cell counts."
+
+fig3_data <- dcjs %>%
+  group_by(arr_yr, arr_re_combi, detained) %>%
+  summarise(conv_rate = mean(convicted) * 100,
+            n = n(), .groups = "drop") %>%
+  filter(n >= 100) %>%
+  mutate(Status = if_else(detained == 1, "Detained", "Released"))
+
+ggplot(fig3_data,
+    aes(x = factor(arr_yr),
+        y = arr_re_combi,
+        fill = conv_rate)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(conv_rate, 1)),
+            size = 3, fontface = "bold",
+            color = "black") +
+  facet_wrap(~ Status) +
+  scale_fill_gradient2(low = "#2980b9", mid = "#f7dc6f",
+                       high = "#c0392b", midpoint = 50,
+                       name = "Conviction\nRate (%)") +
+  labs(
+    title    = "Conviction Rate by Race/Ethnicity, Year and Detention Status",
+    subtitle = "Darker red = higher conviction rate; dashed line marks 2020 bail reform",
+    x        = "Arraignment Year",
+    y        = NULL
+  ) +
+  geom_vline(xintercept = 1.5, color = "white",
+             linewidth = 1.2, linetype = "dashed") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "gray40", size = 11),
+    strip.text      = element_text(face = "bold", size = 11),
+    legend.position = "right",
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+
+We also looked at conviction rates by race and ethnicity, year, and detention status. Detention status does not make a large difference in conviction rates within most racial and ethnic groups. Among detained defendants, conviction rates across the groups stay fairly close and decline at a similar rate over time. Among released defendants, the pattern is different. White defendants had consistently higher conviction rates than Black, Asian, or Hispanic defendants, and the gap increased after the 2020 reform. The White-Black conviction rate gap among released defendants grew from about 12 percentage points in 2019 to about 23 percentage points by 2024. Asian defendants had the largest decline among released cases, with conviction rates falling from about 41% in 2019 to about 25% in 2024. Native American detained-defendant cells for 2020–2021 are left blank in the figure because the cell counts were too small to report reliably.
+
+
+## Machine Learning
+
+
+To test whether pretrial detention still predicts conviction after accounting for other case characteristics, we built two case-level classification models predicting `convicted` (0 or 1): a logistic regression and a random forest classifier. Both models used the same variables: `detained`, `pct_poverty`, `charge_type`, `post_reform`, `arr_re_combi` for race and ethnicity, and `arr_yr`. We trained the models on 80% of the 1,240,386 case-level records (992,308 cases) and used the remaining 20% (248,078 cases) as the test set. The split was stratified by the outcome so that both the training and test sets had similar conviction rates.
+
+
+
+```{python}
+
+#| label: ml-setup
+#| echo: false
+#| message: false
+#| warning: false
+
+import pandas as pd
+import numpy as np
+import pyreadr
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (roc_auc_score, precision_score,
+                              recall_score, f1_score)
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+ml_data = pyreadr.read_r("ml_data.rds")[None]
+ml_data_encoded = pd.get_dummies(
+    ml_data,
+    columns=["charge_type", "post_reform", "arr_re_combi"],
+    drop_first=True
+)
+X = ml_data_encoded.drop(columns=["convicted"])
+y = ml_data_encoded["convicted"]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+```
+
+
+
+
+**Checking for multicollinearity.** Before trusting the logistic regression's
+coefficients as individual effect sizes, we checked variance inflation
+factors (VIF) across the encoded predictor set.
+
+```{python}
+#| label: vif-check
+#| echo: false
+#| message: false
+#| warning: false
+#| output: asis
+
+X_vif = X_train.astype(float)
+X_vif.insert(0, "intercept", 1.0)
+vif_table = pd.DataFrame({
+    "feature": X_vif.columns,
+    "VIF": [variance_inflation_factor(X_vif.values, i)
+            for i in range(X_vif.shape[1])]
+}).query("feature != 'intercept'").sort_values(by="VIF", ascending=False)
+
+print(vif_table.to_markdown(index=False))
+```
+
+Most VIF values are well below the commonly used threshold of 5. The three race/ethnicity dummy variables (`arr_re_combi_Black`, `arr_re_combi_Hispanic`, and `arr_re_combi_White`) are the exception, with values ranging from about 5.3 to 6.5. This is expected because these variables come from the same categorical race/ethnicity variable, so some correlation between them is built into the way they are coded. The other predictors, including `detained`, `pct_poverty`, `charge_type`, `post_reform`, and `arr_yr`, have VIF values close to 1, suggesting there is little correlation among these variables.
+
+
+
+We chose logistic regression and random forest because they give us two different ways to look at the question. Logistic regression is designed for a binary outcome and gives us coefficients that can be interpreted as odds ratios. This lets us look at the direction and size of the relationship between detention and conviction while keeping the other variables constant. Random forest can capture nonlinear relationships and interactions between predictors without us having to define those interactions beforehand. It also gives us feature importance scores that we can compare with the results from the logistic regression.
+
+
+### Logistic Regression Results
+
+```{python}
+#| label: logistic-regression
+#| echo: false
+#| message: false
+#| warning: false
+
+log_model = LogisticRegression(max_iter=1000)
+log_model.fit(X_train, y_train)
+log_coefficients = pd.DataFrame({
+    "feature": X_train.columns,
+    "coefficient": log_model.coef_[0]
+})
+log_coefficients["odds_ratio"] = np.exp(log_coefficients["coefficient"])
+log_coefficients = log_coefficients.sort_values(by="odds_ratio", ascending=False)
+
+print(log_coefficients.to_markdown(index=False))
+```
+After controlling for poverty rate, charge type, arraignment year, reform period, and race and ethnicity, the logistic regression estimates that being detained before trial is associated with 46% higher odds of conviction. The race and ethnicity coefficients are relative to a dropped baseline category, so they should not be interpreted as direct comparisons between groups. We explain this more in the Data Ethics section. As shown below, the random forest performs better across all of the evaluation metrics, so we use its results as our main finding and use the logistic regression mainly to see if the detention effect points in the same direction.
+
+
+### Did the Reform Change Detention's Effect?
+
+Figure 1 shows the detention-conviction gap narrowing after 2020, but that's
+a descriptive comparison of percentages, not a statistical test of whether
+the *relationship* between detention and conviction actually changed. To
+test that directly, we added a `detained * post_reform` interaction term to
+the logistic regression.
+
+```{python}
+#| label: interaction-model
+#| echo: false
+#| message: false
+#| warning: false
+
+X_train_int = X_train.copy()
+X_test_int  = X_test.copy()
+reform_col = [c for c in X_train.columns if c.startswith("post_reform_")][0]
+X_train_int["detained_x_reform"] = X_train_int["detained"] * X_train_int[reform_col]
+X_test_int["detained_x_reform"]  = X_test_int["detained"]  * X_test_int[reform_col]
+
+int_model = LogisticRegression(max_iter=1000)
+int_model.fit(X_train_int, y_train)
+
+int_coefficients = pd.DataFrame({
+    "feature": X_train_int.columns,
+    "coefficient": int_model.coef_[0]
+})
+int_coefficients["odds_ratio"] = np.exp(int_coefficients["coefficient"])
+int_table = int_coefficients[int_coefficients["feature"].isin(
+    ["detained", reform_col, "detained_x_reform"])]
+
+print(int_table.to_markdown(index=False))
+```
+The interaction term came back positive (coefficient = 0.14, odds ratio = 1.15). Because the reference category in this model is the post-reform period, a positive coefficient means detention's association with conviction was stronger before the reform than after, consistent with the reform narrowing the detention-conviction relationship rather than widening it. This is in line with Figure 1's descriptive pattern, not in tension with it.
+Since New York's 2020 reform applies to misdemeanors and not felonies, we also re-ran this interaction model separately on misdemeanor-only and felony-only subsets to see whether the effect is concentrated where the law actually changed anything.
+
+
+
+
+```{python}
+
+#| label: charge-type-reform-test
+#| echo: false
+#| message: false
+#| warning: false
+
+def run_interaction_model(subset_data, label):
+    subset_encoded = pd.get_dummies(
+        subset_data.drop(columns=["charge_type"]),
+        columns=["post_reform", "arr_re_combi"],
+        drop_first=True
+    )
+    X_sub = subset_encoded.drop(columns=["convicted"])
+    y_sub = subset_encoded["convicted"]
+
+    reform_col_sub = [c for c in X_sub.columns if c.startswith("post_reform_")][0]
+    X_sub = X_sub.copy()
+    X_sub["detained_x_reform"] = X_sub["detained"] * X_sub[reform_col_sub]
+
+    model = LogisticRegression(max_iter=5000)
+    model.fit(X_sub, y_sub)
+
+    coefs = pd.DataFrame({
+        "feature": X_sub.columns,
+        "coefficient": model.coef_[0]
+    })
+    coefs["odds_ratio"] = np.exp(coefs["coefficient"])
+    result = coefs[coefs["feature"].isin(
+        ["detained", reform_col_sub, "detained_x_reform"])].copy()
+    result.insert(0, "subset", label)
+    return result
+
+misdemeanor_data = ml_data[ml_data["charge_type"] == "Misdemeanor"].copy()
+felony_data = ml_data[ml_data["charge_type"] == "Felony"].copy()
+
+misd_result = run_interaction_model(misdemeanor_data, "Misdemeanor only")
+felony_result = run_interaction_model(felony_data, "Felony only")
+
+combined = pd.concat([misd_result, felony_result], ignore_index=True)
+print(combined.to_markdown(index=False))
+
+
+```
+
+
+For misdemeanors, the interaction effect is large (odds ratio = 1.59). Detention's association with conviction was much stronger before the reform than after it, which matches Figure 1, where the misdemeanor gap narrowed from 16.1 to 4.2 percentage points. For felonies, the interaction effect is close to zero (odds ratio = 0.96). The reform had very little effect on the relationship between detention and conviction for felony cases, which also matches Figure 1, where the felony gap stayed almost the same (9.5 to 9.7 percentage points). Looking at the results by charge type suggests that the change in the detention-conviction relationship is mainly happening for misdemeanors, where the reform applies, while the relationship for felonies stayed about the same.
+
+
+
+
+
+### Random Forest Results
+
+```{python}
+#| label: random-forest
+#| echo: false
+#| message: false
+#| warning: false
+
+rf_model = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+rf_model.fit(X_train, y_train)
+
+rf_importances = pd.DataFrame({
+    "feature": X_train.columns,
+    "importance": rf_model.feature_importances_
+}).sort_values(by="importance", ascending=False)
+
+print(rf_importances.to_markdown(index=False))
+```
+The random forest gives us a pretty different picture of what matters most. County poverty rate is the most important predictor by far, making up over half of the model's total feature importance. It has more than twice the importance of the next-ranked variable, charge type, and about ten times the importance of detention status. This is very different from what we saw in the logistic regression, where the poverty coefficient was close to zero (odds ratio = 1.01), suggesting almost no relationship.
+
+**Why the two models disagree**
+
+Logistic regression looks at linear relationships between the predictors and the outcome. If the relationship between poverty and conviction is nonlinear or depends on other variables, such as charge type or county context, a random forest can capture those patterns without us having to specify them beforehand. Logistic regression and random forest also measure different things: logistic regression helps us understand statistical relationships, while random forest feature importance tells us which variables are most useful for prediction. Because of this, the two models do not have to identify the same variables as most important. In our case, the difference between the models is useful because it suggests that poverty may have a more complicated relationship with conviction than the logistic regression alone shows.
+
+
+### Model Evaluation
+
+We evaluated both models on the held-out test set using AUC-ROC, precision,
+recall, and F1 score.
+
+```{python}
+#| label: model-evaluation
+#| echo: false
+#| message: false
+#| warning: false
+
+log_pred  = log_model.predict(X_test)
+log_proba = log_model.predict_proba(X_test)[:, 1]
+rf_pred   = rf_model.predict(X_test)
+rf_proba  = rf_model.predict_proba(X_test)[:, 1]
+
+metrics = pd.DataFrame({
+    "Metric": ["AUC-ROC", "Precision", "Recall", "F1 Score"],
+    "Logistic Regression": [
+        roc_auc_score(y_test, log_proba),
+        precision_score(y_test, log_pred),
+        recall_score(y_test, log_pred),
+        f1_score(y_test, log_pred)
+    ],
+    "Random Forest": [
+        roc_auc_score(y_test, rf_proba),
+        precision_score(y_test, rf_pred),
+        recall_score(y_test, rf_pred),
+        f1_score(y_test, rf_pred)
+    ]
+})
+print(metrics.to_markdown(index=False))
+```
+
+The random forest beat logistic regression on every metric. Neither model
+reaches "excellent" discriminative power (closer to 0.85-0.9 AUC); both land
+in a "fair" range, meaning conviction outcomes are only partly explained by
+the case characteristics available here. Things like evidence strength, plea
+negotiations, or individual judge and prosecutor decisions probably matter
+too and aren't captured in this dataset, which is a real limit on how much
+weight either model's coefficients or importances should carry as complete
+explanations.
+
+## Data Ethics
+
+One thing we had to consider with this project is that the people in the dataset did not choose to have their information used for research. DCJS released the Supplemental Pretrial Release Data File to comply with a statutory reporting requirement from the 2019 reform law, not as an opt-in research resource. We worked only with de-identified fields and made no attempt to re-identify anyone.
+
+There are several sources of bias in this dataset. Race, ethnicity, and prior-record fields reflect existing differences in policing and prosecution as much as they reflect individual conduct. A raw comparison of conviction rates by race can't separate differences in defendants' circumstances from differences in enforcement, charging, or plea-bargaining practices that happened before the data was collected. County poverty figures are also measures of the places where defendants live, not their individual economic circumstances. Because of this, we don't want to treat county-level poverty results as statements about individual defendants.
+
+The racial and ethnic findings in Figure 3 and the logistic regression results should also be interpreted carefully. The odds ratios for racial and ethnic categories are relative to a single dropped baseline group and are affected by differences in sample sizes across groups. For example, some Native American figures for 2020–2021 had to be suppressed because the cell counts were too small. We've tried not to present these results as direct claims about any group's behavior. Instead, we view them as patterns in the outcomes that need further investigation rather than causal conclusions.
+
+We also want to be clear about what this analysis does not show. None of the models prove that detention causes worse outcomes. We haven't fully controlled for charge severity or prior criminal record, both of which could affect who gets detained in the first place. Because of this, some of the relationship between detention and conviction could reflect differences in who gets detained rather than an actual effect of detention itself.
+
+## Conclusions
+
+Looking across the three analyses we ran (Figure 1, the county-level weighted regression in Figure 2, and the case-level logistic regression and random forest models), we kept finding the same basic relationship: detained defendants were more likely to be convicted. This relationship was still there after including charge type, county poverty rate, arraignment year, reform period, and race and ethnicity in the case-level models.
+
+The random forest performed better than the logistic regression on every evaluation metric, so we put more weight on those results. County poverty rate was by far the most important predictor in the random forest, while detention status had much less predictive importance. That was different from the logistic regression, where the poverty coefficient was close to zero. The logistic regression did find that detention was associated with 46% higher odds of conviction, but we see that as supporting evidence rather than the main result because the random forest performed better. The fact that the models gave us different results also shows that there is more going on than what we see from one model alone.
+
+The 2020 bail reform also did not have the same effect across all cases. For misdemeanors, the detention-conviction gap dropped from 16.1 to 4.2 percentage points, while the felony gap stayed around 9.5 to 9.7 percentage points. The racial gap among released defendants also did not close after the reform. Instead, the White-Black gap increased from about 12 percentage points in 2019 to about 23 percentage points in 2024. Overall, the results suggest that detention and conviction are related, but the relationship is more complicated than simply whether someone was detained or released.
+
+
+
+## Confidence and limitations
+
+We're confident in the directional findings here (detention is associated with higher conviction odds, poverty shows a small positive relationship with the detention-conviction gap, and the reform's effect on detention's relationship to conviction is concentrated in misdemeanors) because they show up across multiple different approaches. That said, the poverty relationship is weak and only marginally significant (R² = 0.023, p = 0.048), so it should be viewed as a modest finding rather than a strong one. We're less confident about the exact effect sizes overall, since neither classification model got above an AUC of 0.73. This means there is still a lot of variation in conviction outcomes that our models don't explain. Some of that could be related to things like evidence strength, plea negotiations, and prior criminal history, which we weren't able to fully include in the models.
+
+
+## Future work
+
+The next step would be to add prior record and a more detailed measure of charge severity to both models. This would let us better test whether the detention-conviction relationship still holds after accounting for how serious the case was, which is one of the main factors we haven't been able to fully control for. Extending the county poverty data beyond 2020–2022 would also help. Right now, the ACS 5-year estimates limit us to those years for the poverty analysis, so having more years would let us see whether the relationship in Figure 2 holds across the full 2019–2024 period.
+
+Our project brings together two areas that previous research has mostly looked at separately: the relationship between pretrial detention and conviction, and the relationship between county poverty and involvement in the criminal justice system. Looking at both in New York also lets us consider the 2020 bail reform. One thing the results show is that the reform did not have the same effect everywhere. The results differed by charge type and county poverty level, and there were also racial differences among released defendants that we can't fully explain with this data. Looking only at statewide averages could hide some of these differences.
+
+The main question we started with was whether pretrial detention is related to conviction beyond the other factors in a case. Our results suggest that there is a relationship, but we can't say from these models that detention itself caused the higher conviction rates. The relationship was stronger in poorer counties and changed for misdemeanors after the 2020 reform, while the felony relationship stayed fairly similar. We also found that the reform did not eliminate the racial differences among released defendants. There is still a question about how much of the detention-conviction relationship comes from detention itself and how much comes from differences in who gets detained in the first place. Adding prior record and more detailed charge information would be an important next step for figuring that out.
+
+
+
